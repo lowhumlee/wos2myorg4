@@ -92,6 +92,8 @@ def _reset_session_data():
         st.session_state[k] = v() if callable(v) else (
             v.copy() if isinstance(v, (list, dict, set)) else v
         )
+    st.session_state.pop("_api_records", None)
+    st.session_state.pop("_api_key", None)
 
 
 def _store_confirmed_ut(ut: str, decisions: dict[str, dict]):
@@ -237,6 +239,10 @@ def _api_input_section() -> tuple[list[dict], bool]:
         placeholder='e.g. SO="Journal Name"',
     )
 
+    # Persist api_key across rerenders
+    if api_key:
+        st.session_state["_api_key"] = api_key
+
     records: list[dict] = []
 
     if api_key and start_date <= end_date:
@@ -268,7 +274,7 @@ def _api_input_section() -> tuple[list[dict], bool]:
         if "_api_records" in st.session_state:
             records = st.session_state["_api_records"]
 
-    ready = bool(records) and bool(api_key)
+    ready = bool(st.session_state.get("_api_records")) and bool(st.session_state.get("_api_key"))
     return records, ready
 
 
