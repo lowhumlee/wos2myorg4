@@ -51,9 +51,14 @@ class WoSClient:
             database:   WoS database code (default ``"WOS"``).
             extra_query: Additional query terms ANDed to the date filter.
         """
-        # WoS uses PY= for year or PD= for full date — use TS= date trick
-        date_part = f"PD=({start_date.replace('-', '')} TO {end_date.replace('-', '')})"
-        query = f"{date_part} AND OO=Medical University Varna"
+        # WoS Expanded API uses PY= for publication year range
+        start_year = start_date[:4]
+        end_year = end_date[:4]
+        if start_year == end_year:
+            date_part = f"PY={start_year}"
+        else:
+            date_part = f"PY=({start_year}-{end_year})"
+        query = f"OG=(Medical University Varna) AND {date_part}"
         if extra_query:
             query = f"({query}) AND ({extra_query})"
 
