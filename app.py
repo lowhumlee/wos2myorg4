@@ -572,67 +572,93 @@ def _render_author_card(
         return
 
     # ── Confirm path ─────────────────────────────────────────────────────────
+    # is_new starts as True only if no match found AND no search result chosen yet
     is_new = (mt == "new") or (suggested_pid is None)
 
     left, right = st.columns([3, 2])
 
     with left:
-        if is_new:
-            st.caption(f"🆕 New author — staging PID will be assigned on confirm")
-            first_val = st.text_input("First name", value=suggested_first, key=f"first_{key}", disabled=locked)
-            last_val  = st.text_input("Last name",  value=suggested_last,  key=f"last_{key}",  disabled=locked)
-            pid_val   = None  # assigned at lock time
-        else:
-            # Candidate from match + override search
+        # All match types (including "new") get the search picker so user can
+        # find a roster match. For fuzzy/initial the suggested person is pre-selected.
+        # For "new" the picker starts on "➕ Create as NEW PERSON".
+        person_list = st.session_state.person_list
+
+        if mt != "new":
             st.caption(f"Score: {score:.2f} · suggested: {suggested_last}, {suggested_first} (PID {suggested_pid})")
 
-            search_term = st.text_input(
-                "🔍 Override — search roster",
-                value="",
-                key=f"search_{key}",
-                placeholder="Type name to search…",
+        search_term = st.text_input(
+            "🔍 Search roster",
+            value="",
+            key=f"search_{key}",
+            placeholder="Type name to search…",
+            disabled=locked,
+        )
+
+        if search_term:
+            term_norm = normalize_name(search_term)
+            filtered = [
+                p for p in person_list
+                if term_norm in normalize_name(p.get("LastName", ""))
+                or term_norm in normalize_name(p.get("FirstName", ""))
+            ]
+        elif mt != "new" and suggested_pid is not None:
+            # Pre-populate with the suggested match
+            filtered = [p for p in person_list if p["PersonID"] == suggested_pid]
+        else:
+            # "new" with no search yet — show top surname matches from WoS name
+            wos_last_norm = normalize_name(pair["last"])
+            filtered = [
+                p for p in person_list
+                if wos_last_norm in normalize_name(p.get("LastName", ""))
+            ][:10]
+
+        # Build option dict; "➕ Create" always last
+        options = {
+            f"{p['LastName']}, {p['FirstName']} (PID {p['PersonID']})": p
+            for p in filtered[:20]
+        }
+        create_label = f"➕ Create as NEW PERSON ({pair['last'].title()}, {pair['first'].title()})"
+        options[create_label] = None
+
+        # Default selection: suggested person for fuzzy/initial; create for new
+        default_pick = create_label if mt == "new" else list(options.keys())[0]
+
+        pick = st.selectbox(
+            "Select person",
+            list(options.keys()),
+            index=list(options.keys()).index(default_pick) if default_pick in options else len(options) - 1,
+            key=f"pick_{key}",
+            disabled=locked,
+        )
+
+        chosen = options[pick]
+        if chosen is None:
+            # Creating new — use WoS name (editable)
+            is_new    = True
+            pid_val   = None
+            suggested_orgs = []
+            first_val = st.text_input(
+                "First name (new author)",
+                value=pair["first"].title(),
+                key=f"first_{key}",
                 disabled=locked,
             )
-            person_list = st.session_state.person_list
-            if search_term:
-                term_norm = normalize_name(search_term)
-                filtered  = [
-                    p for p in person_list
-                    if term_norm in normalize_name(p.get("LastName", ""))
-                    or term_norm in normalize_name(p.get("FirstName", ""))
-                ]
-            else:
-                filtered = [p for p in person_list if p["PersonID"] == suggested_pid]
-
-            options = {
-                f"{p['LastName']}, {p['FirstName']} (PID {p['PersonID']})": p
-                for p in filtered[:20]
-            }
-            options["➕ Create as NEW PERSON"] = None
-
-            pick = st.selectbox(
-                "Select person",
-                list(options.keys()),
-                key=f"pick_{key}",
+            last_val = st.text_input(
+                "Last name (new author)",
+                value=pair["last"].title(),
+                key=f"last_{key}",
                 disabled=locked,
             )
-
-            chosen = options[pick]
-            if chosen is None:
-                # User chose to create new
-                is_new     = True
-                pid_val    = None
-                first_val  = suggested_first
-                last_val   = suggested_last
-                suggested_orgs = []
-                st.caption("🆕 Will be created as new author")
-            else:
-                pid_val       = chosen["PersonID"]
-                first_val     = chosen["FirstName"]
-                last_val      = chosen["LastName"]
-                suggested_orgs = chosen.get("OrganizationIDs") or (
-                    [chosen["OrganizationID"]] if chosen.get("OrganizationID") else []
-                )
+            st.caption(f"🆕 Staging PID will be assigned on confirm")
+        else:
+            is_new        = False
+            pid_val       = chosen["PersonID"]
+            first_val     = chosen["FirstName"]
+            last_val      = chosen["LastName"]
+            suggested_orgs = chosen.get("OrganizationIDs") or (
+                [chosen["OrganizationID"]] if chosen.get("OrganizationID") else []
+            )
+            st.caption(f"✔ {last_val}, {first_val} (PID {pid_val})")
 
     with right:
         org_map = st.session_state.get("org_map", {})
