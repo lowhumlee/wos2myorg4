@@ -83,7 +83,10 @@ def _next_staging_pid() -> int:
 
 
 def _dec_key(pair: dict) -> str:
-    return f"{pair['last']}|{pair['first']}|{pair['doc_id']}"
+    # pair dicts use last/first; match result dicts use raw_last/raw_first
+    last = pair.get("last") or pair.get("raw_last", "")
+    first = pair.get("first") or pair.get("raw_first", "")
+    return f"{last}|{first}|{pair['doc_id']}"
 
 
 def _reset_session_data():
