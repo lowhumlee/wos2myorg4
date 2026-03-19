@@ -1,0 +1,39 @@
+{
+  "organization_id": "MED_UNIV_VARNA",
+  "affiliation_patterns": [
+    "medical university varna",
+    "med univ varna",
+    "mu varna",
+    "medical university of varna",
+    "med univ prof dr paraskev stoyanov varna",
+    "med univ prof dr paraskev stoyanov",
+    "varna med univ",
+    "paraskev stoyanov varna",
+    "muv varna",
+    "med univ prof paraskev stoyanov varna",
+    "med univ prof paraskev stoyanov",
+    "paraskev stoyanov"
+  ],
+  "hospital_partners": [
+    "st marina",
+    "sveta marina",
+    "univ hosp varna",
+    "st anna",
+    "university hospital varna"
+  ],
+  "special_cases": [
+    {"contains": ["med univ bulgaria", "varna"], "mode": "all"},
+    {"contains": ["med univ,", "varna"], "mode": "all", "excludes": ["sofia", "plovdiv", "pleven"]}
+  ],
+  "matching": {
+    "fuzzy_threshold": 0.85,
+    "initial_expansion_threshold": 0.80,
+    "probable_duplicate_threshold": 0.92
+  },
+  "api": {
+    "base_url": "https://wos-api.clarivate.com/api/wos",
+    "page_size": 100,
+    "max_retries": 5,
+    "backoff_base": 2
+  }
+}
