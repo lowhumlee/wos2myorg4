@@ -3,12 +3,19 @@ core.py — Parsing, MUV extraction, and batch processing.
 
 Handles both WoS JSON (from api.py) and WoS CSV (user upload).
 All matching is delegated to matching.py.
+
+JSON structure confirmed from export.json:
+  REC → UID
+  REC → static_data → summary → names → name[]
+  REC → static_data → fullrecord_metadata → addresses → address_name[]
+    → address_spec → addr_no (int), organizations → organization[], city, country
 """
 
 import csv
 import io
+import json
 import logging
-import unicodedata
+import re
 from typing import Optional
 
 import pandas as pd
@@ -17,63 +24,44 @@ from matching import match_author_pair, normalize_name, parse_wos_name
 
 logger = logging.getLogger(__name__)
 
+_STRUCTURE_LOGGED = False
+
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
 def load_config(path: str = "config.json") -> dict:
-    """Load and return config.json as a dict.
-
-    Args:
-        path: Path to config file.
-    """
-    import json
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
 # ---------------------------------------------------------------------------
-# Master person index (ResearcherAndDocument.csv)
+# Master person index
 # ---------------------------------------------------------------------------
 
 def build_person_index(csv_bytes: bytes) -> tuple[list[dict], int, set]:
-    """Parse ResearcherAndDocument.csv into a usable index.
-
-    Args:
-        csv_bytes: Raw bytes of the CSV file.
-
-    Returns:
-        Tuple of:
-        - ``person_list``: List of person dicts (PersonID, FirstName, LastName, …).
-        - ``max_pid``:     Highest numeric PersonID present.
-        - ``existing_pairs``: Set of ``(PersonID, DocumentID)`` already in MyOrg.
-    """
+    """Parse ResearcherAndDocument.csv → (person_list, max_pid, existing_pairs)."""
     df = pd.read_csv(io.BytesIO(csv_bytes), dtype=str).fillna("")
     required = {"PersonID", "FirstName", "LastName", "DocumentID"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"ResearcherAndDocument.csv missing columns: {missing}")
 
-    person_list: list[dict] = []
     existing_pairs: set = set()
     max_pid = 0
-
     seen_pids: dict[str, dict] = {}
 
     for _, row in df.iterrows():
         pid_str = row["PersonID"].strip()
         doc_id = row["DocumentID"].strip()
-
         try:
             pid_int = int(pid_str)
         except ValueError:
             logger.warning("Non-integer PersonID skipped: %s", pid_str)
             continue
-
         max_pid = max(max_pid, pid_int)
         existing_pairs.add((pid_int, doc_id))
-
         if pid_str not in seen_pids:
             seen_pids[pid_str] = {
                 "PersonID": pid_int,
@@ -85,22 +73,12 @@ def build_person_index(csv_bytes: bytes) -> tuple[list[dict], int, set]:
     person_list = list(seen_pids.values())
     logger.info(
         "Person index: %d unique persons, %d existing pairs, max PID=%d",
-        len(person_list),
-        len(existing_pairs),
-        max_pid,
+        len(person_list), len(existing_pairs), max_pid,
     )
     return person_list, max_pid, existing_pairs
 
 
 def parse_org_hierarchy(csv_bytes: bytes) -> list[dict]:
-    """Parse OrgHierarchy.csv into a list of org dicts (optional).
-
-    Args:
-        csv_bytes: Raw bytes of the CSV file.
-
-    Returns:
-        List of dicts with org info.
-    """
     df = pd.read_csv(io.BytesIO(csv_bytes), dtype=str).fillna("")
     return df.to_dict("records")
 
@@ -110,114 +88,145 @@ def parse_org_hierarchy(csv_bytes: bytes) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def _is_muv_affiliation(norm_affil: str, cfg: dict) -> bool:
-    """Return True if a normalised affiliation string belongs to MUV.
-
-    Args:
-        norm_affil: Normalised (lowercase, ASCII) affiliation string.
-        cfg:        Full config dict.
-
-    Returns:
-        True if the affiliation matches MUV patterns.
-    """
-    patterns: list[str] = cfg.get("affiliation_patterns", [])
-    for pat in patterns:
+    for pat in cfg.get("affiliation_patterns", []):
         if pat in norm_affil:
             return True
-
-    # Special cases
     for sc in cfg.get("special_cases", []):
-        contains: list[str] = sc.get("contains", [])
-        excludes: list[str] = sc.get("excludes", [])
-        mode: str = sc.get("mode", "all")
-        if mode == "all":
+        contains = sc.get("contains", [])
+        excludes = sc.get("excludes", [])
+        if sc.get("mode", "all") == "all":
             if all(c in norm_affil for c in contains):
                 if not any(e in norm_affil for e in excludes):
                     return True
-
     return False
 
 
 def _norm(s: str) -> str:
-    """Convenience alias for full normalisation."""
     return normalize_name(s)
 
 
+def _ensure_list(val) -> list:
+    if val is None:
+        return []
+    return val if isinstance(val, list) else [val]
+
+
 # ---------------------------------------------------------------------------
-# WoS JSON parsing
+# WoS JSON parsing  (structure confirmed from export.json)
 # ---------------------------------------------------------------------------
+
+def _log_structure_once(raw: dict):
+    global _STRUCTURE_LOGGED
+    if _STRUCTURE_LOGGED:
+        return
+    _STRUCTURE_LOGGED = True
+
+    def _peek(obj, depth=0):
+        if depth >= 3:
+            return "..."
+        if isinstance(obj, dict):
+            return {k: _peek(v, depth + 1) for k, v in list(obj.items())[:5]}
+        if isinstance(obj, list):
+            return [_peek(obj[0], depth + 1)] if obj else []
+        return repr(obj)[:60]
+
+    logger.info("=== WoS JSON record structure ===\n%s", json.dumps(_peek(raw), indent=2))
+
 
 def parse_wos_json_record(raw: dict) -> Optional[dict]:
-    """Parse one raw WoS JSON record into a normalised internal dict.
+    """Parse one WoS JSON REC dict into internal format.
 
-    Args:
-        raw: Raw record dict from api.py.
-
-    Returns:
-        Parsed dict with keys ``UT``, ``AU_list``, ``addr_map``, or None on failure.
+    Confirmed paths (export.json):
+      UID                                                   → doc id
+      static_data.summary.names.name[]                      → authors
+        .last_name, .first_name, .display_name, .addr_no (str "1 2")
+      static_data.fullrecord_metadata.addresses.address_name[]
+        .address_spec.addr_no (int)
+        .address_spec.organizations.organization[].content
+        .address_spec.city, .country
     """
+    _log_structure_once(raw)
+
     try:
-        ut: str = raw.get("UID", "").strip()
+        ut: str = (raw.get("UID") or "").strip()
         if not ut:
-            logger.warning("Record missing UID, skipping")
+            logger.warning("Record missing UID, keys: %s", list(raw.keys()))
             return None
 
-        sd = raw.get("static_data", {})
-        summary = sd.get("summary", {})
+        sd = raw.get("static_data") or {}
 
-        # --- Authors ---
-        names_node = summary.get("names", {})
-        name_items = names_node.get("name", [])
-        if isinstance(name_items, dict):
-            name_items = [name_items]
+        # ── Authors ──────────────────────────────────────────────────────────
+        names_node = (sd.get("summary") or {}).get("names") or {}
+        name_items = _ensure_list(names_node.get("name"))
 
         authors = []
         for n in name_items:
-            if n.get("role", "").lower() != "author":
+            if (n.get("role") or "").lower() not in ("author", ""):
                 continue
-            addr_nos_raw = n.get("addr_no", "")
-            addr_nos = (
-                [int(x) for x in str(addr_nos_raw).split() if x.isdigit()]
-                if addr_nos_raw
-                else []
-            )
-            authors.append(
-                {
-                    "display": n.get("full_name", n.get("display_name", "")),
-                    "last": _norm(n.get("last_name", "")),
-                    "first": _norm(n.get("first_name", "")),
-                    "addr_nos": addr_nos,
-                    "orcid": n.get("orcid_id", ""),
-                }
-            )
 
-        # --- Addresses ---
-        fm = raw.get("fullrecord_metadata", {})
-        addr_names = fm.get("addresses", {}).get("address_name", [])
-        if isinstance(addr_names, dict):
-            addr_names = [addr_names]
+            # addr_no is a space-separated string in summary names: "1 2"
+            addr_nos_raw = n.get("addr_no") or ""
+            addr_nos = [int(x) for x in str(addr_nos_raw).split() if x.isdigit()]
+
+            last = _norm(n.get("last_name") or "")
+            first = _norm(n.get("first_name") or "")
+            display = n.get("display_name") or n.get("full_name") or f"{last}, {first}"
+
+            # ORCID lives in data-item-ids
+            orcid = ""
+            for item in _ensure_list((n.get("data-item-ids") or {}).get("data-item-id")):
+                if isinstance(item, dict) and "ORCID" in (item.get("id-type") or ""):
+                    orcid = item.get("content") or ""
+                    break
+
+            if not last:
+                continue
+
+            authors.append({
+                "display": display,
+                "last": last,
+                "first": first,
+                "addr_nos": addr_nos,
+                "orcid": orcid,
+            })
+
+        # ── Addresses ────────────────────────────────────────────────────────
+        # fullrecord_metadata is INSIDE static_data (confirmed from export.json)
+        fm = sd.get("fullrecord_metadata") or {}
+        addr_names = _ensure_list((fm.get("addresses") or {}).get("address_name"))
 
         addr_map: dict[int, str] = {}
         for addr in addr_names:
-            spec = addr.get("address_spec", {})
+            spec = addr.get("address_spec") or {}
+
+            # addr_no is an int here
             try:
-                addr_no = int(spec.get("addr_no", -1))
+                addr_no = int(spec.get("addr_no") or -1)
             except (ValueError, TypeError):
                 continue
-            orgs = spec.get("organizations", {}).get("organization", [])
-            if isinstance(orgs, dict):
-                orgs = [orgs]
-            org_names = []
-            for org in orgs:
-                content = org.get("content", "") if isinstance(org, dict) else str(org)
-                if content:
-                    org_names.append(content)
-            full_affil = " ".join(org_names) + " " + spec.get("city", "")
-            addr_map[addr_no] = _norm(full_affil)
+
+            parts: list[str] = []
+
+            # organizations → organization[] → content
+            org_items = _ensure_list((spec.get("organizations") or {}).get("organization"))
+            for org in org_items:
+                text = (org.get("content") or "") if isinstance(org, dict) else str(org)
+                if text:
+                    parts.append(text)
+
+            parts.append(spec.get("city") or "")
+            parts.append(spec.get("country") or "")
+
+            if addr_no >= 0:
+                addr_map[addr_no] = _norm(" ".join(p for p in parts if p))
+
+        if not addr_map:
+            logger.debug("UT %s: empty addr_map", ut)
 
         return {"UT": ut, "AU_list": authors, "addr_map": addr_map}
 
     except Exception as exc:
-        logger.error("Failed to parse JSON record: %s", exc)
+        logger.error("Failed to parse JSON record: %s", exc, exc_info=True)
         return None
 
 
@@ -226,14 +235,6 @@ def parse_wos_json_record(raw: dict) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 def parse_wos_csv(csv_bytes: bytes) -> list[dict]:
-    """Parse a WoS plain-text CSV export into internal record dicts.
-
-    Args:
-        csv_bytes: Raw bytes of the WoS export CSV.
-
-    Returns:
-        List of dicts with keys ``UT``, ``AU_list``, ``addr_map``.
-    """
     try:
         text = csv_bytes.decode("utf-8-sig")
     except UnicodeDecodeError:
@@ -247,45 +248,34 @@ def parse_wos_csv(csv_bytes: bytes) -> list[dict]:
         if not ut:
             continue
 
-        # AU / AF / C1 columns
-        au_raw: list[str] = [a.strip() for a in (row.get("AU") or "").split(";") if a.strip()]
-        af_raw: list[str] = [a.strip() for a in (row.get("AF") or "").split(";") if a.strip()]
-        c1_raw: str = (row.get("C1") or "").strip()
-        c3_raw: str = (row.get("C3") or "").strip()
+        au_raw = [a.strip() for a in (row.get("AU") or "").split(";") if a.strip()]
+        af_raw = [a.strip() for a in (row.get("AF") or "").split(";") if a.strip()]
+        c1_raw = (row.get("C1") or "").strip()
+        c3_raw = (row.get("C3") or "").strip()
 
         authors = []
         for idx, au in enumerate(au_raw):
             last, first = parse_wos_name(au)
-            full_name = af_raw[idx] if idx < len(af_raw) else au
-            authors.append(
-                {
-                    "display": full_name,
-                    "last": last,
-                    "first": first,
-                    "addr_nos": [],  # CSV has no addr_no linkage
-                    "orcid": "",
-                    "c1_fragment": "",  # filled below
-                }
-            )
+            display = af_raw[idx] if idx < len(af_raw) else au
+            authors.append({
+                "display": display,
+                "last": last,
+                "first": first,
+                "addr_nos": [],
+                "orcid": "",
+                "c1_fragment": "",
+            })
 
-        # Build a simple addr_map from C1 blocks
-        addr_map: dict[int, str] = {}
         if c1_raw:
-            # C1 format: "[Author A; Author B] Affiliation text. [Author C] Other affil."
-            import re
-            blocks = re.findall(r"\[([^\]]+)\]\s*([^[]+)", c1_raw)
-            for au_group, affil in blocks:
+            for au_group, affil in re.findall(r"\[([^\]]+)\]\s*([^[]+)", c1_raw):
                 affil_norm = _norm(affil)
                 for au_name in au_group.split(";"):
-                    au_name = au_name.strip()
-                    au_last, _ = parse_wos_name(au_name)
+                    au_last, _ = parse_wos_name(au_name.strip())
                     for auth in authors:
                         if auth["last"] == au_last:
                             auth["c1_fragment"] = affil_norm
 
-        records.append(
-            {"UT": ut, "AU_list": authors, "addr_map": addr_map, "C3": _norm(c3_raw)}
-        )
+        records.append({"UT": ut, "AU_list": authors, "addr_map": {}, "C3": _norm(c3_raw)})
 
     logger.info("Parsed %d records from WoS CSV", len(records))
     return records
@@ -296,21 +286,8 @@ def parse_wos_csv(csv_bytes: bytes) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def extract_muv_author_pairs(records: list[dict], cfg: dict) -> list[dict]:
-    """Filter records to (author, document) pairs affiliated with MUV.
-
-    Implements two-tier C3 fallback for CSV records:
-    - Tier 1: No MUV found in C1 → add authors whose C1 fragment contains "varna".
-    - Tier 2: Some MUV in C1 → add hospital partners linked to the same paper.
-
-    Args:
-        records: Output of :func:`parse_wos_csv` or JSON records list.
-        cfg:     Full config dict.
-
-    Returns:
-        List of author-document pair dicts:
-        ``{last, first, display, doc_id, affil, source}``.
-    """
-    hospital_patterns: list[str] = [_norm(p) for p in cfg.get("hospital_partners", [])]
+    """Filter records to MUV-affiliated (author, document) pairs."""
+    hospital_patterns = [_norm(p) for p in cfg.get("hospital_partners", [])]
     pairs: list[dict] = []
     skipped = 0
 
@@ -318,66 +295,54 @@ def extract_muv_author_pairs(records: list[dict], cfg: dict) -> list[dict]:
         ut = rec["UT"]
         au_list = rec.get("AU_list", [])
         addr_map = rec.get("addr_map", {})
-        c3 = rec.get("C3", "")
 
         if not au_list:
-            logger.debug("UT %s: no authors, skipping", ut)
             skipped += 1
             continue
 
-        muv_pairs_this_ut: list[dict] = []
+        muv_pairs: list[dict] = []
         has_any_muv = False
 
         for auth in au_list:
-            # Resolve affiliation string
-            affil_str = _resolve_affiliation(auth, addr_map)
-
-            if _is_muv_affiliation(affil_str, cfg):
+            affil = _resolve_affiliation(auth, addr_map)
+            if _is_muv_affiliation(affil, cfg):
                 has_any_muv = True
-                muv_pairs_this_ut.append(_make_pair(auth, ut, affil_str, "direct"))
+                muv_pairs.append(_make_pair(auth, ut, affil, "direct"))
 
-        # C3 Tier 1: no MUV at all in C1/JSON → fallback to varna keyword
+        # C3 Tier 1: nothing matched via addr_map — try c1_fragment + varna keyword
         if not has_any_muv:
             for auth in au_list:
-                affil_str = _resolve_affiliation(auth, addr_map)
-                if "varna" in affil_str and not any(
-                    p["display"] == auth["display"] and p["doc_id"] == ut
-                    for p in muv_pairs_this_ut
-                ):
-                    muv_pairs_this_ut.append(_make_pair(auth, ut, affil_str, "c3_tier1"))
+                affil = auth.get("c1_fragment", "") or _resolve_affiliation(auth, addr_map)
+                if "varna" in affil and not _already_in(auth, ut, muv_pairs):
+                    muv_pairs.append(_make_pair(auth, ut, affil, "c3_tier1"))
 
-        # C3 Tier 2: some MUV → also add hospital partners
+        # C3 Tier 2: some MUV — also pull hospital-partner authors
         if has_any_muv:
             for auth in au_list:
-                affil_str = _resolve_affiliation(auth, addr_map)
-                if any(hp in affil_str for hp in hospital_patterns):
-                    if not any(
-                        p["display"] == auth["display"] and p["doc_id"] == ut
-                        for p in muv_pairs_this_ut
-                    ):
-                        muv_pairs_this_ut.append(_make_pair(auth, ut, affil_str, "c3_tier2"))
+                affil = _resolve_affiliation(auth, addr_map)
+                if any(hp in affil for hp in hospital_patterns) and not _already_in(auth, ut, muv_pairs):
+                    muv_pairs.append(_make_pair(auth, ut, affil, "c3_tier2"))
 
-        if not muv_pairs_this_ut:
-            logger.debug("UT %s: no MUV authors found", ut)
+        if not muv_pairs:
+            logger.debug("UT %s: no MUV authors", ut)
             skipped += 1
 
-        pairs.extend(muv_pairs_this_ut)
+        pairs.extend(muv_pairs)
 
-    logger.info(
-        "Extracted %d MUV author-document pairs (%d UTs skipped)", len(pairs), skipped
-    )
+    logger.info("Extracted %d MUV author-document pairs (%d UTs skipped)", len(pairs), skipped)
     return pairs
 
 
 def _resolve_affiliation(auth: dict, addr_map: dict[int, str]) -> str:
-    """Get normalised affiliation string for an author.
-
-    Prefers JSON addr_no linkage; falls back to c1_fragment from CSV parsing.
-    """
+    """Resolve affiliation string for an author via addr_nos → addr_map."""
     if auth.get("addr_nos"):
         parts = [addr_map.get(no, "") for no in auth["addr_nos"]]
         return " ".join(p for p in parts if p)
     return auth.get("c1_fragment", "")
+
+
+def _already_in(auth: dict, ut: str, pairs: list[dict]) -> bool:
+    return any(p["display"] == auth["display"] and p["doc_id"] == ut for p in pairs)
 
 
 def _make_pair(auth: dict, doc_id: str, affil: str, source: str) -> dict:
@@ -403,25 +368,7 @@ def batch_process(
     cfg: dict,
     max_pid: int,
 ) -> dict:
-    """Match all author-document pairs against the master roster.
-
-    Args:
-        pairs:          Output of :func:`extract_muv_author_pairs`.
-        person_list:    From :func:`build_person_index`.
-        existing_pairs: From :func:`build_person_index`.
-        cfg:            Full config dict.
-        max_pid:        Highest existing PersonID.
-
-    Returns:
-        Dict with keys:
-        ``confirmed`` (auto-matched), ``needs_review``, ``already_uploaded``,
-        ``new_persons`` (authors needing new PIDs).
-        Each value is a list of result dicts.
-    """
-    confirmed: list[dict] = []
-    needs_review: list[dict] = []
-    already_uploaded: list[dict] = []
-    new_persons: list[dict] = []
+    confirmed, needs_review, already_uploaded, new_persons = [], [], [], []
 
     for pair in pairs:
         result = match_author_pair(pair, person_list, existing_pairs, cfg, max_pid)
@@ -441,10 +388,7 @@ def batch_process(
 
     logger.info(
         "Batch: %d confirmed, %d needs review, %d already uploaded, %d new",
-        len(confirmed),
-        len(needs_review),
-        len(already_uploaded),
-        len(new_persons),
+        len(confirmed), len(needs_review), len(already_uploaded), len(new_persons),
     )
     return {
         "confirmed": confirmed,
@@ -455,47 +399,17 @@ def batch_process(
 
 
 # ---------------------------------------------------------------------------
-# UT grouping helper
+# Helpers
 # ---------------------------------------------------------------------------
 
 def group_by_ut(pairs: list[dict]) -> dict[str, list[dict]]:
-    """Group author-document pairs by UT (document ID).
-
-    Args:
-        pairs: List of pair dicts (each has ``doc_id``).
-
-    Returns:
-        Ordered dict mapping UT → list of pairs for that UT.
-    """
     grouped: dict[str, list[dict]] = {}
     for p in pairs:
         grouped.setdefault(p["doc_id"], []).append(p)
     return grouped
 
 
-# ---------------------------------------------------------------------------
-# Export helpers
-# ---------------------------------------------------------------------------
-
-def build_upload_row(
-    pid: int,
-    first: str,
-    last: str,
-    doc_id: str,
-    org_id: str,
-) -> dict:
-    """Build one row for upload.csv.
-
-    Args:
-        pid:    PersonID (int).
-        first:  FirstName.
-        last:   LastName.
-        doc_id: WoS DocumentID (UT).
-        org_id: OrganizationID from config.
-
-    Returns:
-        Dict with the five required columns.
-    """
+def build_upload_row(pid: int, first: str, last: str, doc_id: str, org_id: str) -> dict:
     return {
         "PersonID": pid,
         "FirstName": first,
@@ -506,14 +420,6 @@ def build_upload_row(
 
 
 def deduplicate_upload_rows(rows: list[dict]) -> list[dict]:
-    """Remove duplicate (PersonID, DocumentID) rows.
-
-    Args:
-        rows: List of upload row dicts.
-
-    Returns:
-        Deduplicated list preserving first occurrence.
-    """
     seen: set = set()
     out: list[dict] = []
     for row in rows:
