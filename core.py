@@ -1,9 +1,6 @@
 """
 core.py — Parsing, MUV extraction, and batch processing.
 
-Handles both WoS JSON (from api.py) and WoS CSV (user upload).
-All matching is delegated to matching.py.
-
 JSON structure confirmed from export.json:
   REC → UID
   REC → static_data → summary → names → name[]
@@ -41,7 +38,13 @@ def load_config(path: str = "config.json") -> dict:
 # ---------------------------------------------------------------------------
 
 def build_person_index(csv_bytes: bytes) -> tuple[list[dict], int, set]:
-    """Parse ResearcherAndDocument.csv → (person_list, max_pid, existing_pairs)."""
+    """Parse ResearcherAndDocument.csv → (person_list, max_pid, existing_pairs).
+
+    Each person dict carries:
+      PersonID, FirstName, LastName,
+      OrganizationID  – first/primary org ID (backward compat)
+      OrganizationIDs – deduplicated list of ALL org IDs for this person
+    """
     df = pd.read_csv(io.BytesIO(csv_bytes), dtype=str).fillna("")
     required = {"PersonID", "FirstName", "LastName", "DocumentID"}
     missing = required - set(df.columns)
@@ -54,21 +57,29 @@ def build_person_index(csv_bytes: bytes) -> tuple[list[dict], int, set]:
 
     for _, row in df.iterrows():
         pid_str = row["PersonID"].strip()
-        doc_id = row["DocumentID"].strip()
+        doc_id  = row["DocumentID"].strip()
+        oid     = row.get("OrganizationID", "").strip()
         try:
             pid_int = int(pid_str)
         except ValueError:
             logger.warning("Non-integer PersonID skipped: %s", pid_str)
             continue
+
         max_pid = max(max_pid, pid_int)
         existing_pairs.add((pid_int, doc_id))
+
         if pid_str not in seen_pids:
             seen_pids[pid_str] = {
-                "PersonID": pid_int,
-                "FirstName": row.get("FirstName", "").strip(),
-                "LastName": row.get("LastName", "").strip(),
-                "OrganizationID": row.get("OrganizationID", "").strip(),
+                "PersonID":       pid_int,
+                "FirstName":      row.get("FirstName", "").strip(),
+                "LastName":       row.get("LastName", "").strip(),
+                "OrganizationID":  oid,
+                "OrganizationIDs": [oid] if oid else [],
             }
+        else:
+            # Accumulate additional org IDs for the same person
+            if oid and oid not in seen_pids[pid_str]["OrganizationIDs"]:
+                seen_pids[pid_str]["OrganizationIDs"].append(oid)
 
     person_list = list(seen_pids.values())
     logger.info(
@@ -79,6 +90,7 @@ def build_person_index(csv_bytes: bytes) -> tuple[list[dict], int, set]:
 
 
 def parse_org_hierarchy(csv_bytes: bytes) -> list[dict]:
+    """Parse OrgHierarchy.csv → list of org dicts."""
     df = pd.read_csv(io.BytesIO(csv_bytes), dtype=str).fillna("")
     return df.to_dict("records")
 
@@ -134,23 +146,19 @@ def _log_structure_once(raw: dict):
 
 
 def parse_wos_json_record(raw: dict) -> Optional[dict]:
-    """Parse one WoS JSON REC dict into internal format.
+    """Parse one WoS JSON REC into internal format.
 
-    Confirmed paths (export.json):
-      UID                                                   → doc id
-      static_data.summary.names.name[]                      → authors
-        .last_name, .first_name, .display_name, .addr_no (str "1 2")
-      static_data.fullrecord_metadata.addresses.address_name[]
-        .address_spec.addr_no (int)
-        .address_spec.organizations.organization[].content
-        .address_spec.city, .country
+    Returns dict with:
+      UT        – WoS document ID
+      AU_list   – list of author dicts (last, first, display, addr_nos, orcid)
+      addr_map  – {addr_no: normalised_affil_string}
+      addr_raw  – {addr_no: raw full_address string} for display in UI
     """
     _log_structure_once(raw)
 
     try:
         ut: str = (raw.get("UID") or "").strip()
         if not ut:
-            logger.warning("Record missing UID, keys: %s", list(raw.keys()))
             return None
 
         sd = raw.get("static_data") or {}
@@ -164,15 +172,13 @@ def parse_wos_json_record(raw: dict) -> Optional[dict]:
             if (n.get("role") or "").lower() not in ("author", ""):
                 continue
 
-            # addr_no is a space-separated string in summary names: "1 2"
             addr_nos_raw = n.get("addr_no") or ""
             addr_nos = [int(x) for x in str(addr_nos_raw).split() if x.isdigit()]
 
-            last = _norm(n.get("last_name") or "")
-            first = _norm(n.get("first_name") or "")
+            last    = _norm(n.get("last_name") or "")
+            first   = _norm(n.get("first_name") or "")
             display = n.get("display_name") or n.get("full_name") or f"{last}, {first}"
 
-            # ORCID lives in data-item-ids
             orcid = ""
             for item in _ensure_list((n.get("data-item-ids") or {}).get("data-item-id")):
                 if isinstance(item, dict) and "ORCID" in (item.get("id-type") or ""):
@@ -183,31 +189,28 @@ def parse_wos_json_record(raw: dict) -> Optional[dict]:
                 continue
 
             authors.append({
-                "display": display,
-                "last": last,
-                "first": first,
+                "display":  display,
+                "last":     last,
+                "first":    first,
                 "addr_nos": addr_nos,
-                "orcid": orcid,
+                "orcid":    orcid,
             })
 
         # ── Addresses ────────────────────────────────────────────────────────
-        # fullrecord_metadata is INSIDE static_data (confirmed from export.json)
         fm = sd.get("fullrecord_metadata") or {}
         addr_names = _ensure_list((fm.get("addresses") or {}).get("address_name"))
 
-        addr_map: dict[int, str] = {}
+        addr_map: dict[int, str] = {}   # normalised, for MUV detection
+        addr_raw: dict[int, str] = {}   # original full_address, for UI display
+
         for addr in addr_names:
             spec = addr.get("address_spec") or {}
-
-            # addr_no is an int here
             try:
                 addr_no = int(spec.get("addr_no") or -1)
             except (ValueError, TypeError):
                 continue
 
             parts: list[str] = []
-
-            # organizations → organization[] → content
             org_items = _ensure_list((spec.get("organizations") or {}).get("organization"))
             for org in org_items:
                 text = (org.get("content") or "") if isinstance(org, dict) else str(org)
@@ -219,11 +222,10 @@ def parse_wos_json_record(raw: dict) -> Optional[dict]:
 
             if addr_no >= 0:
                 addr_map[addr_no] = _norm(" ".join(p for p in parts if p))
+                # Keep the raw full_address for display; fall back to joined parts
+                addr_raw[addr_no] = spec.get("full_address") or ", ".join(p for p in parts if p)
 
-        if not addr_map:
-            logger.debug("UT %s: empty addr_map", ut)
-
-        return {"UT": ut, "AU_list": authors, "addr_map": addr_map}
+        return {"UT": ut, "AU_list": authors, "addr_map": addr_map, "addr_raw": addr_raw}
 
     except Exception as exc:
         logger.error("Failed to parse JSON record: %s", exc, exc_info=True)
@@ -258,12 +260,12 @@ def parse_wos_csv(csv_bytes: bytes) -> list[dict]:
             last, first = parse_wos_name(au)
             display = af_raw[idx] if idx < len(af_raw) else au
             authors.append({
-                "display": display,
-                "last": last,
-                "first": first,
-                "addr_nos": [],
-                "orcid": "",
-                "c1_fragment": "",
+                "display":      display,
+                "last":         last,
+                "first":        first,
+                "addr_nos":     [],
+                "orcid":        "",
+                "c1_fragment":  "",
             })
 
         if c1_raw:
@@ -275,7 +277,13 @@ def parse_wos_csv(csv_bytes: bytes) -> list[dict]:
                         if auth["last"] == au_last:
                             auth["c1_fragment"] = affil_norm
 
-        records.append({"UT": ut, "AU_list": authors, "addr_map": {}, "C3": _norm(c3_raw)})
+        records.append({
+            "UT":      ut,
+            "AU_list": authors,
+            "addr_map": {},
+            "addr_raw": {},
+            "C3":      _norm(c3_raw),
+        })
 
     logger.info("Parsed %d records from WoS CSV", len(records))
     return records
@@ -286,15 +294,21 @@ def parse_wos_csv(csv_bytes: bytes) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def extract_muv_author_pairs(records: list[dict], cfg: dict) -> list[dict]:
-    """Filter records to MUV-affiliated (author, document) pairs."""
+    """Filter records to MUV-affiliated (author, document) pairs.
+
+    Each pair dict carries:
+      last, first, display, orcid, doc_id, affil (normalised),
+      affil_display (raw, for UI), source
+    """
     hospital_patterns = [_norm(p) for p in cfg.get("hospital_partners", [])]
     pairs: list[dict] = []
     skipped = 0
 
     for rec in records:
-        ut = rec["UT"]
-        au_list = rec.get("AU_list", [])
+        ut       = rec["UT"]
+        au_list  = rec.get("AU_list", [])
         addr_map = rec.get("addr_map", {})
+        addr_raw = rec.get("addr_raw", {})
 
         if not au_list:
             skipped += 1
@@ -304,27 +318,27 @@ def extract_muv_author_pairs(records: list[dict], cfg: dict) -> list[dict]:
         has_any_muv = False
 
         for auth in au_list:
-            affil = _resolve_affiliation(auth, addr_map)
+            affil      = _resolve_affiliation(auth, addr_map)
+            affil_disp = _resolve_affiliation_raw(auth, addr_raw)
             if _is_muv_affiliation(affil, cfg):
                 has_any_muv = True
-                muv_pairs.append(_make_pair(auth, ut, affil, "direct"))
+                muv_pairs.append(_make_pair(auth, ut, affil, affil_disp, "direct"))
 
-        # C3 Tier 1: nothing matched via addr_map — try c1_fragment + varna keyword
         if not has_any_muv:
             for auth in au_list:
-                affil = auth.get("c1_fragment", "") or _resolve_affiliation(auth, addr_map)
+                affil      = auth.get("c1_fragment", "") or _resolve_affiliation(auth, addr_map)
+                affil_disp = _resolve_affiliation_raw(auth, addr_raw)
                 if "varna" in affil and not _already_in(auth, ut, muv_pairs):
-                    muv_pairs.append(_make_pair(auth, ut, affil, "c3_tier1"))
+                    muv_pairs.append(_make_pair(auth, ut, affil, affil_disp, "c3_tier1"))
 
-        # C3 Tier 2: some MUV — also pull hospital-partner authors
         if has_any_muv:
             for auth in au_list:
-                affil = _resolve_affiliation(auth, addr_map)
+                affil      = _resolve_affiliation(auth, addr_map)
+                affil_disp = _resolve_affiliation_raw(auth, addr_raw)
                 if any(hp in affil for hp in hospital_patterns) and not _already_in(auth, ut, muv_pairs):
-                    muv_pairs.append(_make_pair(auth, ut, affil, "c3_tier2"))
+                    muv_pairs.append(_make_pair(auth, ut, affil, affil_disp, "c3_tier2"))
 
         if not muv_pairs:
-            logger.debug("UT %s: no MUV authors", ut)
             skipped += 1
 
         pairs.extend(muv_pairs)
@@ -334,10 +348,16 @@ def extract_muv_author_pairs(records: list[dict], cfg: dict) -> list[dict]:
 
 
 def _resolve_affiliation(auth: dict, addr_map: dict[int, str]) -> str:
-    """Resolve affiliation string for an author via addr_nos → addr_map."""
     if auth.get("addr_nos"):
-        parts = [addr_map.get(no, "") for no in auth["addr_nos"]]
-        return " ".join(p for p in parts if p)
+        return " ".join(addr_map.get(no, "") for no in auth["addr_nos"] if addr_map.get(no))
+    return auth.get("c1_fragment", "")
+
+
+def _resolve_affiliation_raw(auth: dict, addr_raw: dict[int, str]) -> str:
+    """Return the human-readable affiliation string for UI display."""
+    if auth.get("addr_nos"):
+        parts = [addr_raw.get(no, "") for no in auth["addr_nos"] if addr_raw.get(no)]
+        return " | ".join(dict.fromkeys(parts))  # deduplicated, order-preserved
     return auth.get("c1_fragment", "")
 
 
@@ -345,15 +365,16 @@ def _already_in(auth: dict, ut: str, pairs: list[dict]) -> bool:
     return any(p["display"] == auth["display"] and p["doc_id"] == ut for p in pairs)
 
 
-def _make_pair(auth: dict, doc_id: str, affil: str, source: str) -> dict:
+def _make_pair(auth: dict, doc_id: str, affil: str, affil_display: str, source: str) -> dict:
     return {
-        "last": auth["last"],
-        "first": auth["first"],
-        "display": auth["display"],
-        "orcid": auth.get("orcid", ""),
-        "doc_id": doc_id,
-        "affil": affil,
-        "source": source,
+        "last":          auth["last"],
+        "first":         auth["first"],
+        "display":       auth["display"],
+        "orcid":         auth.get("orcid", ""),
+        "doc_id":        doc_id,
+        "affil":         affil,
+        "affil_display": affil_display,
+        "source":        source,
     }
 
 
@@ -391,10 +412,10 @@ def batch_process(
         len(confirmed), len(needs_review), len(already_uploaded), len(new_persons),
     )
     return {
-        "confirmed": confirmed,
-        "needs_review": needs_review,
+        "confirmed":       confirmed,
+        "needs_review":    needs_review,
         "already_uploaded": already_uploaded,
-        "new_persons": new_persons,
+        "new_persons":     new_persons,
     }
 
 
@@ -411,11 +432,11 @@ def group_by_ut(pairs: list[dict]) -> dict[str, list[dict]]:
 
 def build_upload_row(pid: int, first: str, last: str, doc_id: str, org_id: str) -> dict:
     return {
-        "PersonID": pid,
-        "FirstName": first,
-        "LastName": last,
+        "PersonID":       pid,
+        "FirstName":      first,
+        "LastName":       last,
         "OrganizationID": org_id,
-        "DocumentID": doc_id,
+        "DocumentID":     doc_id,
     }
 
 
