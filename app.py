@@ -124,6 +124,7 @@ def _store_confirmed_ut(ut: str, decisions: dict[str, dict]):
         is_new = dec.get("is_new", False)
 
         # One row per org ID (existing authors may have multiple)
+        # Do NOT substitute ORG_ID here — use whatever the decision stored
         org_ids = dec.get("org_ids") or [dec.get("org_id", "")]
         if not org_ids:
             org_ids = [""]
@@ -354,20 +355,26 @@ def _csv_input_section() -> tuple[list[dict], bool]:
 
 
 def _prepopulate_confirmed(confirmed_pairs: list[dict]):
-    """Store auto-confirmed exact matches (org IDs from roster) into author_decs."""
+    """Store auto-confirmed exact matches (org IDs from roster) into author_decs.
+
+    Always overwrites — exact matches are deterministic and must reflect
+    the roster org IDs, not any stale session state.
+    """
     for pair in confirmed_pairs:
         key = _dec_key(pair)
-        if key not in st.session_state.author_decs:
-            st.session_state.author_decs[key] = {
-                "action":  "confirm",
-                "pid":     pair["suggested_pid"],
-                "first":   pair["suggested_first"],
-                "last":    pair["suggested_last"],
-                "org_ids": pair.get("suggested_org_ids") or [ORG_ID],
-                "doc_id":  pair["doc_id"],
-                "is_new":  False,
-                "note":    "AU exact match",
-            }
+        org_ids = pair.get("suggested_org_ids")
+        if not org_ids:
+            org_ids = [ORG_ID]
+        st.session_state.author_decs[key] = {
+            "action":  "confirm",
+            "pid":     pair["suggested_pid"],
+            "first":   pair["suggested_first"],
+            "last":    pair["suggested_last"],
+            "org_ids": org_ids,
+            "doc_id":  pair["doc_id"],
+            "is_new":  False,
+            "note":    "AU exact match",
+        }
 
 
 # ---------------------------------------------------------------------------
