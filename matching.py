@@ -107,10 +107,16 @@ def match_author(
             if _initials_match(wos_first, m_first):
                 return _make_result("initial_expansion", person, 0.90)
 
-        # Fuzzy
+        # Fuzzy — also catch "eleonora" vs "eleonora g" (one is prefix of the other)
         first_sim = name_similarity(wos_first, m_first)
-        if first_sim >= fuzzy_thresh and first_sim > best_fuzzy_score:
-            best_fuzzy_score = first_sim
+        prefix_match = (
+            wos_first and m_first and (
+                m_first.startswith(wos_first) or wos_first.startswith(m_first)
+            )
+        )
+        effective_sim = max(first_sim, 0.87 if prefix_match else 0.0)
+        if effective_sim >= fuzzy_thresh and effective_sim > best_fuzzy_score:
+            best_fuzzy_score = effective_sim
             best_fuzzy = person
 
     if best_fuzzy is not None:
