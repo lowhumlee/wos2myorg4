@@ -62,6 +62,7 @@ KEYS_DEFAULTS = {
     "source":               None,
     "orgs":                 [],
     "org_map":              {},
+    "current_ut_idx":       0,
 }
 
 for k, v in KEYS_DEFAULTS.items():
@@ -94,6 +95,21 @@ def _reset_session_data():
         st.session_state[k] = v.copy() if isinstance(v, (list, dict, set)) else v
     st.session_state.pop("_api_records", None)
     st.session_state.pop("_api_key", None)
+
+
+def _advance_to_next_unlocked(ut_list: list[str]):
+    """Move current_ut_idx to the next unlocked UT after the current one.
+    Wraps around if needed. Stays put if all UTs are locked.
+    """
+    cur = st.session_state.current_ut_idx
+    n   = len(ut_list)
+    # Search forward from cur+1, then wrap from 0
+    for offset in range(1, n + 1):
+        candidate = (cur + offset) % n
+        if not st.session_state.ut_locked.get(ut_list[candidate]):
+            st.session_state.current_ut_idx = candidate
+            return
+    # All locked — stay on current
 
 
 def _store_confirmed_ut(ut: str, decisions: dict[str, dict]):
@@ -395,9 +411,42 @@ def tab_review():
     locked_count = sum(1 for ut in ut_list if st.session_state.ut_locked.get(ut))
     st.progress(locked_count / len(ut_list), text=f"{locked_count} / {len(ut_list)} UTs confirmed")
 
-    ut_options  = [f"{'✅' if st.session_state.ut_locked.get(ut) else '🔲'} {ut}" for ut in ut_list]
-    selected_idx = st.selectbox("Select UT", range(len(ut_list)), format_func=lambda i: ut_options[i])
-    ut          = ut_list[selected_idx]
+    # ── UT navigation ─────────────────────────────────────────────────────────
+    n = len(ut_list)
+
+    # Clamp stored index in case list shrank
+    if st.session_state.current_ut_idx >= n:
+        st.session_state.current_ut_idx = n - 1
+
+    ut_options = [
+        f"{'✅' if st.session_state.ut_locked.get(u) else '🔲'} ({i+1}/{n}) {u}"
+        for i, u in enumerate(ut_list)
+    ]
+
+    nav_col1, nav_col2, nav_col3 = st.columns([1, 6, 1])
+    with nav_col1:
+        if st.button("◀ Prev", use_container_width=True,
+                     disabled=st.session_state.current_ut_idx == 0):
+            st.session_state.current_ut_idx -= 1
+            st.rerun()
+    with nav_col2:
+        selected_idx = st.selectbox(
+            "Select UT",
+            range(n),
+            index=st.session_state.current_ut_idx,
+            format_func=lambda i: ut_options[i],
+            label_visibility="collapsed",
+        )
+        if selected_idx != st.session_state.current_ut_idx:
+            st.session_state.current_ut_idx = selected_idx
+            st.rerun()
+    with nav_col3:
+        if st.button("Next ▶", use_container_width=True,
+                     disabled=st.session_state.current_ut_idx == n - 1):
+            st.session_state.current_ut_idx += 1
+            st.rerun()
+
+    ut          = ut_list[st.session_state.current_ut_idx]
     pairs       = pairs_by_ut.get(ut, [])
     locked_flag = st.session_state.ut_locked.get(ut, False)
 
@@ -467,6 +516,7 @@ def tab_review():
             for key, dec in decisions.items():
                 st.session_state.author_decs[key] = dec
             _store_confirmed_ut(ut, decisions)
+            _advance_to_next_unlocked(ut_list)
             st.rerun()
     with col_skip_all:
         if st.button("⏭ Skip entire UT", use_container_width=True):
@@ -476,6 +526,7 @@ def tab_review():
                 for p in pairs
             }
             _store_confirmed_ut(ut, skip_decs)
+            _advance_to_next_unlocked(ut_list)
             st.rerun()
 
 
