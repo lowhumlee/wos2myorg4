@@ -418,8 +418,19 @@ def tab_review():
     if st.session_state.current_ut_idx >= n:
         st.session_state.current_ut_idx = n - 1
 
+    def _ut_icon(u: str) -> str:
+        if not st.session_state.ut_locked.get(u):
+            return "🔲"
+        # Check if it was auto-skipped (all already in MO)
+        u_already = {(r.get("raw_last"), r.get("raw_first"))
+                     for r in batch.get("already_uploaded", []) if r.get("doc_id") == u}
+        u_pairs = pairs_by_ut.get(u, [])
+        if u_pairs and all((p["last"], p["first"]) in u_already for p in u_pairs):
+            return "⏭"
+        return "✅"
+
     ut_options = [
-        f"{'✅' if st.session_state.ut_locked.get(u) else '🔲'} ({i+1}/{n}) {u}"
+        f"{_ut_icon(u)} ({i+1}/{n}) {u}"
         for i, u in enumerate(ut_list)
     ]
 
@@ -474,8 +485,28 @@ def tab_review():
                     f"PID {r.get('suggested_pid','')} | Org: {', '.join(orgs)}"
                 )
 
+    # ── Auto-skip: all MUV authors already in MyOrg ─────────────────────────
+    already_pids = {(r.get("raw_last"), r.get("raw_first")) for r in already}
+    all_in_mo = len(pairs) > 0 and all(
+        (p["last"], p["first"]) in already_pids for p in pairs
+    )
+    if all_in_mo and not locked_flag:
+        # Lock silently as 2SKIP and move on
+        skip_decs = {
+            _dec_key(p): {"action": "skip", "display": p["display"],
+                           "doc_id": p["doc_id"], "note": "All authors already in MyOrg"}
+            for p in pairs
+        }
+        _store_confirmed_ut(ut, skip_decs)
+        _advance_to_next_unlocked(ut_list)
+        st.rerun()
+
     if locked_flag:
-        st.success("✅ This UT has been confirmed.")
+        locked_note = st.session_state.ut_locked.get(ut)
+        if all_in_mo:
+            st.info("⏭ Auto-skipped — all authors already in MyOrg.")
+        else:
+            st.success("✅ This UT has been confirmed.")
         if st.button("↩️ Unlock to re-review", use_container_width=True):
             st.session_state.ut_locked[ut] = False
             st.session_state.confirmed_rows = [
