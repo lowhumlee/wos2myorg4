@@ -32,10 +32,6 @@ class WoSClient:
             {"X-ApiKey": self.api_key, "Accept": "application/json"}
         )
 
-    # ------------------------------------------------------------------
-    # Public
-    # ------------------------------------------------------------------
-
     def query_date_range(
         self,
         start_date: str,
@@ -51,13 +47,13 @@ class WoSClient:
             database:   WoS database code (default ``"WOS"``).
             extra_query: Additional query terms ANDed to the date filter.
         """
-        # WoS Expanded API uses PY= for publication year range
         start_year = start_date[:4]
         end_year = end_date[:4]
         if start_year == end_year:
             date_part = f"PY={start_year}"
         else:
             date_part = f"PY=({start_year}-{end_year})"
+
         query = f"OG=(Medical University Varna) AND {date_part}"
         if extra_query:
             query = f"({query}) AND ({extra_query})"
@@ -69,8 +65,7 @@ class WoSClient:
 
         while True:
             batch = self._fetch_page(query, database, first_record)
-            records_in_batch = batch.get("Data", {}).get("Records", {}).get("records", {})
-            record_list = self._extract_record_list(records_in_batch)
+            record_list = self._extract_record_list(batch)
 
             if not record_list:
                 logger.info("No more records. Total fetched: %d", total_fetched)
@@ -80,20 +75,12 @@ class WoSClient:
                 yield rec
 
             total_fetched += len(record_list)
-            logger.info(
-                "Fetched %d records (page starting at %d)",
-                len(record_list),
-                first_record,
-            )
+            logger.info("Fetched %d records (page starting at %d)", len(record_list), first_record)
 
             if len(record_list) < self.page_size:
-                break  # last page
+                break
 
             first_record += self.page_size
-
-    # ------------------------------------------------------------------
-    # Internal
-    # ------------------------------------------------------------------
 
     def _fetch_page(self, query: str, database: str, first_record: int) -> dict:
         """Fetch one page with exponential-backoff retry."""
@@ -103,36 +90,21 @@ class WoSClient:
             "count": self.page_size,
             "firstRecord": first_record,
         }
-        url = f"{self.base_url}"
 
         for attempt in range(1, self.max_retries + 1):
             try:
-                resp = self.session.get(url, params=params, timeout=30)
+                resp = self.session.get(self.base_url, params=params, timeout=30)
 
                 if resp.status_code == 200:
                     return resp.json()
 
-                if resp.status_code == 429:
+                if resp.status_code in (429, 500, 502, 503, 504):
                     wait = self.backoff_base ** attempt
-                    logger.warning("Rate limited. Waiting %.1fs (attempt %d)", wait, attempt)
+                    logger.warning("HTTP %d. Waiting %.1fs (attempt %d)", resp.status_code, wait, attempt)
                     time.sleep(wait)
                     continue
 
-                if resp.status_code >= 500:
-                    wait = self.backoff_base ** attempt
-                    logger.warning(
-                        "Server error %d. Waiting %.1fs (attempt %d)",
-                        resp.status_code,
-                        wait,
-                        attempt,
-                    )
-                    time.sleep(wait)
-                    continue
-
-                # 4xx other than 429 — not retryable
-                raise WoSAPIError(
-                    f"API error {resp.status_code}: {resp.text[:200]}"
-                )
+                raise WoSAPIError(f"API error {resp.status_code}: {resp.text[:300]}")
 
             except requests.exceptions.ConnectionError as exc:
                 wait = self.backoff_base ** attempt
@@ -140,22 +112,52 @@ class WoSClient:
                 time.sleep(wait)
 
         raise WoSAPIError(
-            f"Failed to fetch page at firstRecord={first_record} after {self.max_retries} attempts"
+            f"Failed after {self.max_retries} attempts at firstRecord={first_record}"
         )
 
     @staticmethod
-    def _extract_record_list(records_node) -> list:
-        """Normalise the records container to a plain list."""
-        if not records_node:
+    def _extract_record_list(batch: dict) -> list:
+        """Extract the list of records from a raw API response.
+
+        Confirmed JSON path from export.json: top-level has 'Data' key,
+        then Data → Records → records → REC (list).
+        Falls back defensively to other known variants.
+        """
+        if not batch or not isinstance(batch, dict):
             return []
-        if isinstance(records_node, list):
-            return records_node
-        # Sometimes wrapped in another dict layer
-        if isinstance(records_node, dict):
-            for key in ("REC", "rec", "record"):
-                if key in records_node:
-                    val = records_node[key]
-                    return val if isinstance(val, list) else [val]
+
+        # Primary: Data → Records → records → REC
+        try:
+            recs = batch["Data"]["Records"]["records"]["REC"]
+            return recs if isinstance(recs, list) else [recs]
+        except (KeyError, TypeError):
+            pass
+
+        # Secondary: Records → records → REC  (some endpoints omit 'Data')
+        try:
+            recs = batch["Records"]["records"]["REC"]
+            return recs if isinstance(recs, list) else [recs]
+        except (KeyError, TypeError):
+            pass
+
+        # Tertiary: walk tree looking for REC
+        def _find_rec(obj, depth=0):
+            if depth > 6 or not isinstance(obj, dict):
+                return None
+            for k, v in obj.items():
+                if k == "REC":
+                    return v if isinstance(v, list) else [v]
+                found = _find_rec(v, depth + 1)
+                if found is not None:
+                    return found
+            return None
+
+        found = _find_rec(batch)
+        if found:
+            logger.warning("Used fallback REC search — check API response structure")
+            return found
+
+        logger.error("Could not find records. Top-level keys: %s", list(batch.keys()))
         return []
 
 
