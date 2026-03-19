@@ -146,7 +146,9 @@ def _store_confirmed_ut(ut: str, decisions: dict[str, dict]):
             org_ids = [""]
 
         for oid in org_ids:
-            k = (pid, doc_id, oid)
+            # Use name+doc+org as dedup key — pid may be None for new authors
+            # so (None, doc_id, oid) would incorrectly deduplicate multiple new persons
+            k = (normalize_name(first), normalize_name(last), doc_id, oid)
             if k in seen:
                 continue
             seen.add(k)
